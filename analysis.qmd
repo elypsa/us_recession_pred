@@ -1,0 +1,501 @@
+---
+title: "AR(1) Probit Model for US Recession Prediction"
+author: "MS"
+format:
+  html:
+    code-fold: false
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+    df-print: paged
+execute:
+  warning: false
+  message: false
+---
+
+## Setup
+
+Load required packages and source estimation functions:
+
+```{r setup}
+library(tidyverse)
+library(lubridate)
+library(rsample)
+
+# Source MCL estimation functions
+source("R/functions.R")
+
+# Set theme for plots
+theme_set(theme_minimal(base_size = 12))
+```
+
+## Load and Explore Data
+
+```{r load-data}
+# Load quarterly recession data
+load("data/df_quarterly.Rdata")
+
+# Overview
+df_quarterly %>%
+  glimpse()
+
+# Recession summary
+df_quarterly %>%
+  count(recession_flag) %>%
+  mutate(
+    status = if_else(recession_flag == 1, "Recession", "Expansion"),
+    proportion = scales::percent(n / sum(n), accuracy = 0.1)
+  )
+```
+
+### Time Series Visualization
+
+```{r plot-timeseries, fig.width=10, fig.height=8, echo = F}
+# Long format for plotting
+df_long <- df_quarterly %>%
+  pivot_longer(
+    cols = c(yield_spread, NFCI),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+# Plot with recession shading
+ggplot() +
+  geom_rect(
+    data = df_quarterly %>% filter(recession_flag == 1),
+    aes(xmin = date, xmax = date + months(3), ymin = -Inf, ymax = Inf),
+    fill = "gray80", alpha = 0.5
+  ) +
+  geom_line(
+    data = df_long,
+    aes(x = date, y = value, color = variable),
+    linewidth = 0.8
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  facet_wrap(~variable, ncol = 1, scales = "free_y") +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "US Recession Predictors Over Time",
+    subtitle = "Gray bars indicate recession quarters",
+    x = "Date",
+    y = "Value"
+  ) +
+  theme(legend.position = "none")
+```
+
+## Time Series Cross-Validation Setup
+
+Create expanding window resamples for out-of-sample evaluation:
+
+```{r create-folds}
+# Create expanding window resamples
+# Initial training: 40 quarters (10 years)
+# Step forward 1 quarter at a time
+# This creates a TRUE rolling forecast: each window fits at time T and forecasts T+1, T+2, etc.
+
+folds <- sliding_period(
+  df_quarterly,
+  index = date,
+  period = "quarter",
+  lookback = Inf,         # Expanding window (use all history)
+  assess_stop = 4,        # Assess next 4 quarters for h=1,2,3,4 evaluation
+  skip = 39,              # Skip first 39 quarters (need 40 for initial training)
+  step = 1                # Step forward 1 quarter
+)
+
+# Inspect the folds
+cat("Number of resamples:", nrow(folds), "\n\n")
+
+cat("First 3 folds:\n")
+for (i in 1:min(3, nrow(folds))) {
+  split <- folds$splits[[i]]
+  train_data <- analysis(split)
+  test_data <- assessment(split)
+
+  cat("Fold", i, ":\n")
+  cat("  Training (up to T): n =", nrow(train_data),
+      " | ", as.character(min(train_data$date)), "to",
+      as.character(max(train_data$date)), "\n")
+  cat("  Testing (T+1 to T+4): n =", nrow(test_data),
+      " | ", as.character(min(test_data$date)), "to",
+      as.character(max(test_data$date)), "\n\n")
+}
+```
+
+### Visualize Resampling Scheme
+
+```{r plot-folds, fig.width=10, fig.height=8, echo = F}
+# Extract fold information for visualization
+fold_info <- map_dfr(seq_len(min(30, nrow(folds))), function(i) {
+  split <- folds$splits[[i]]
+  train_data <- analysis(split)
+  test_data <- assessment(split)
+
+  tibble(
+    fold = i,
+    train_start = min(train_data$date),
+    train_end = max(train_data$date),
+    test_start = min(test_data$date),
+    test_end = max(test_data$date)
+  )
+})
+
+# Plot (show first 30 folds for clarity)
+fold_info %>%
+  ggplot(aes(y = fold)) +
+  geom_segment(
+    aes(x = train_start, xend = train_end, yend = fold),
+    color = "steelblue", linewidth = 2
+  ) +
+  geom_segment(
+    aes(x = test_start, xend = test_end, yend = fold),
+    color = "firebrick", linewidth = 2
+  ) +
+  scale_y_reverse() +
+  labs(
+    title = "Expanding Window Resampling Scheme (First 30 Folds)",
+    subtitle = "Blue = Training (up to time T) | Red = Testing (T+1 to T+4)",
+    x = "Date",
+    y = "Fold"
+  ) +
+  theme(panel.grid.minor = element_blank())
+```
+
+## Model Estimation and Forecasting Across Windows
+
+For each window:
+1. Fit model on training data (up to time T)
+2. Generate forecasts for h=1,2,3,4 using ONLY information at time T
+3. Compare forecasts to actual values in test period
+
+```{r rolling-forecasts}
+# Function to evaluate one fold
+evaluate_fold <- function(split, fold_id) {
+
+  # Extract train and test data
+  train_data <- analysis(split)
+  test_data <- assessment(split)
+
+  # Fit model on training data (up to time T)
+  fit <- estimate_ar_probit_mcl(
+    recession_flag ~ yield_spread + NFCI,
+    data = train_data,
+    lag_m = 4
+  )
+
+  # Generate forecasts for h=1,2,3,4 from time T
+  # NO test data is used in prediction - only training info
+  horizons <- 1:4
+  forecasts <- predict(fit, h = horizons, type = "prob")
+
+  # Create results tibble
+  # Match forecasts to actual values
+  results <- tibble(
+    fold = fold_id,
+    train_end = max(train_data$date),
+    horizon = horizons,
+    forecast_date = train_end + months(3 * horizons),
+    forecast_prob = forecasts,
+    actual = NA_real_
+  )
+
+  # Match actual values from test data
+  for (j in 1:nrow(results)) {
+    matching_row <- which(test_data$date == results$forecast_date[j])
+    if (length(matching_row) > 0) {
+      results$actual[j] <- test_data$recession_flag[matching_row[1]]
+    }
+  }
+
+  # Add coefficient estimates
+  results$rho <- fit$coefficients["rho"]
+  results$alpha <- fit$coefficients["alpha"]
+  results$beta_yield <- fit$coefficients["yield_spread"]
+  results$beta_nfci <- fit$coefficients["NFCI"]
+  results$convergence <- fit$convergence
+
+  return(results)
+}
+
+# Evaluate all folds (this may take a few minutes)
+cat("Evaluating", nrow(folds), "folds...\n")
+
+all_forecasts <- map_dfr(
+  seq_len(nrow(folds)),
+  function(i) {
+    if (i %% 20 == 0) cat("  Fold", i, "of", nrow(folds), "\n")
+    evaluate_fold(folds$splits[[i]], i)
+  }
+)
+
+# Remove rows with missing actual values (happens at the end)
+all_forecasts <- all_forecasts %>%
+  filter(!is.na(actual))
+
+cat("Done! Evaluated", length(unique(all_forecasts$fold)), "folds.\n")
+cat("Total forecasts:", nrow(all_forecasts), "\n")
+```
+
+## Forecast Performance Metrics
+
+Calculate performance metrics by horizon:
+
+```{r metrics}
+# Calculate metrics by horizon
+metrics_by_horizon <- all_forecasts %>%
+  group_by(horizon) %>%
+  summarise(
+    n_forecasts = n(),
+    mean_forecast = mean(forecast_prob),
+    mean_actual = mean(actual),
+    # Mean Squared Error (Brier Score)
+    mse = mean((forecast_prob - actual)^2),
+    # Mean Absolute Error
+    mae = mean(abs(forecast_prob - actual)),
+    # Log Loss
+    log_loss = -mean(actual * log(pmax(forecast_prob, 1e-15)) +
+                     (1 - actual) * log(pmax(1 - forecast_prob, 1e-15))),
+    .groups = "drop"
+  )
+
+metrics_by_horizon
+```
+
+### Performance by Horizon
+
+```{r plot-metrics-horizon, fig.width=10, fig.height=6}
+# Reshape for plotting
+metrics_long <- metrics_by_horizon %>%
+  select(horizon, mse, mae, log_loss) %>%
+  pivot_longer(
+    cols = c(mse, mae, log_loss),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+# Plot
+metrics_long %>%
+  ggplot(aes(x = horizon, y = value, color = metric)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  facet_wrap(~metric, scales = "free_y", ncol = 1) +
+  scale_x_continuous(breaks = 1:4) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "Forecast Performance by Horizon",
+    subtitle = "Performance degrades slightly with longer horizons",
+    x = "Forecast Horizon (quarters ahead)",
+    y = "Metric Value"
+  ) +
+  theme(legend.position = "none")
+```
+
+### Metrics Over Time (for h=1)
+
+```{r metrics-over-time, fig.width=10, fig.height=8}
+# Calculate rolling metrics for h=1 forecasts
+h1_forecasts <- all_forecasts %>%
+  filter(horizon == 1) %>%
+  arrange(forecast_date) %>%
+  mutate(
+    squared_error = (forecast_prob - actual)^2,
+    abs_error = abs(forecast_prob - actual),
+    log_loss_contrib = -(actual * log(pmax(forecast_prob, 1e-15)) +
+                        (1 - actual) * log(pmax(1 - forecast_prob, 1e-15)))
+  )
+
+# Plot metrics over time
+h1_forecasts %>%
+  select(forecast_date, squared_error, abs_error, log_loss_contrib) %>%
+  pivot_longer(
+    cols = c(squared_error, abs_error, log_loss_contrib),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = forecast_date, y = value)) +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  geom_smooth(method = "loess", se = TRUE, color = "firebrick", linewidth = 0.8) +
+  facet_wrap(~metric, scales = "free_y", ncol = 1) +
+  labs(
+    title = "1-Quarter Ahead Forecast Errors Over Time",
+    subtitle = "Blue line = actual errors | Red line = smoothed trend",
+    x = "Forecast Date",
+    y = "Error"
+  )
+```
+
+## Forecast Visualization
+
+### Out-of-Sample Forecasts (h=1)
+
+```{r plot-forecasts-h1, fig.width=10, fig.height=6}
+# Plot 1-quarter ahead forecasts
+h1_forecasts %>%
+  ggplot(aes(x = forecast_date)) +
+  # Recession shading
+  geom_rect(
+    data = df_quarterly %>% filter(recession_flag == 1),
+    aes(xmin = date, xmax = date + months(3), ymin = -Inf, ymax = Inf),
+    fill = "gray80", alpha = 0.5, inherit.aes = FALSE
+  ) +
+  # Forecast probabilities
+  geom_line(aes(y = forecast_prob), color = "steelblue", linewidth = 1) +
+  geom_point(
+    data = h1_forecasts %>% filter(actual == 1),
+    aes(y = forecast_prob), color = "firebrick", size = 2
+  ) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", alpha = 0.5) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(
+    title = "Out-of-Sample 1-Quarter Ahead Recession Forecasts",
+    subtitle = "Gray bars = actual recessions | Red points = recession quarters | Blue line = forecasted probability",
+    x = "Forecast Date",
+    y = "P(Recession)"
+  )
+```
+
+### Comparison Across Horizons
+
+```{r plot-all-horizons, fig.width=10, fig.height=6}
+# Plot all horizons for recent period
+recent_forecasts <- all_forecasts %>%
+  filter(forecast_date >= as.Date("2000-01-01"))
+
+recent_forecasts %>%
+  ggplot(aes(x = forecast_date, y = forecast_prob, color = factor(horizon))) +
+  # Recession shading
+  geom_rect(
+    data = df_quarterly %>%
+      filter(recession_flag == 1, date >= as.Date("2000-01-01")),
+    aes(xmin = date, xmax = date + months(3), ymin = -Inf, ymax = Inf),
+    fill = "gray80", alpha = 0.3, inherit.aes = FALSE
+  ) +
+  geom_line(linewidth = 0.8, alpha = 0.8) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", alpha = 0.3) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  scale_color_brewer(palette = "Set1", name = "Horizon") +
+  labs(
+    title = "Out-of-Sample Forecasts by Horizon (2000-Present)",
+    subtitle = "Gray bars indicate actual recessions",
+    x = "Forecast Date",
+    y = "P(Recession)"
+  )
+```
+
+### Calibration Plot
+
+```{r calibration, fig.width=7, fig.height=6}
+# Calibration plot for h=1 forecasts
+h1_forecasts %>%
+  mutate(
+    prob_bin = cut(
+      forecast_prob,
+      breaks = seq(0, 1, by = 0.1),
+      include.lowest = TRUE
+    )
+  ) %>%
+  group_by(prob_bin) %>%
+  summarise(
+    mean_predicted = mean(forecast_prob),
+    mean_actual = mean(actual),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(prob_bin)) %>%
+  ggplot(aes(x = mean_predicted, y = mean_actual)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(aes(size = n), color = "steelblue", alpha = 0.7) +
+  geom_line(color = "steelblue") +
+  scale_x_continuous(limits = c(0, 1), labels = scales::percent) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(
+    title = "Calibration Plot (1-Quarter Ahead, Out-of-Sample)",
+    subtitle = "Perfect calibration lies on the diagonal",
+    x = "Predicted Probability",
+    y = "Observed Frequency",
+    size = "n obs"
+  ) +
+  coord_equal()
+```
+
+## Parameter Stability
+
+Check if estimated parameters are stable across windows:
+
+```{r parameter-stability, fig.width=10, fig.height=8}
+# Parameter evolution over time
+param_evolution <- all_forecasts %>%
+  filter(horizon == 1) %>%  # One row per fold
+  select(fold, train_end, rho, alpha, beta_yield, beta_nfci) %>%
+  distinct()
+
+# Plot
+param_evolution %>%
+  pivot_longer(
+    cols = c(rho, alpha, beta_yield, beta_nfci),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = train_end, y = value)) +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  geom_smooth(method = "loess", se = TRUE, color = "firebrick", linewidth = 0.6) +
+  facet_wrap(~parameter, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Parameter Estimates Over Time",
+    subtitle = "Blue line = estimates | Red line = smoothed trend",
+    x = "Training Period End Date",
+    y = "Parameter Value"
+  )
+```
+
+## Final Model
+
+Fit final model on all available data:
+
+```{r final-model}
+# Fit on full dataset
+final_fit <- estimate_ar_probit_mcl(
+  recession_flag ~ yield_spread + NFCI,
+  data = df_quarterly,
+  lag_m = 4
+)
+
+# Display results
+summary(final_fit)
+```
+
+### In-Sample Fit
+
+```{r final-fit-plot, fig.width=10, fig.height=5}
+# Get fitted probabilities
+fitted_probs <- fitted(final_fit, type = "prob")
+
+# Create data frame (accounting for lag)
+fitted_df <- tibble(
+  date = df_quarterly$date[(final_fit$lag_m + 1):nrow(df_quarterly)],
+  actual = final_fit$y,
+  fitted_prob = fitted_probs
+)
+
+# Plot
+fitted_df %>%
+  ggplot(aes(x = date)) +
+  geom_rect(
+    data = fitted_df %>% filter(actual == 1),
+    aes(xmin = date, xmax = date + months(3), ymin = -Inf, ymax = Inf),
+    fill = "gray80", alpha = 0.5
+  ) +
+  geom_line(aes(y = fitted_prob), color = "steelblue", linewidth = 1) +
+  geom_point(
+    data = fitted_df %>% filter(actual == 1),
+    aes(y = fitted_prob), color = "firebrick", size = 2
+  ) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", alpha = 0.5) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(
+    title = "Final Model: In-Sample Fitted Probabilities",
+    subtitle = "Gray bars = actual recessions | Red points = recession quarters",
+    x = "Date",
+    y = "P(Recession)"
+  )
+```
